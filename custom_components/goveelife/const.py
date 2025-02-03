@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from typing import Final
+from homeassistant.components.humidifier import HumidifierEntityFeature
 
 DOMAIN: Final = 'goveelife'
 FUNC_OPTION_UPDATES: Final = 'options_update_listener'
@@ -21,3 +22,15 @@ CONF_ENTRY_ID: Final = 'entry_id'
 CLOUD_API_URL_DEVELOPER: Final = 'https://developer-api.govee.com/v1/appliance/devices/'
 CLOUD_API_URL_OPENAPI: Final = 'https://openapi.api.govee.com/router/api/v1'
 CLOUD_API_HEADER_KEY: Final = 'Govee-API-Key'
+
+CONF_SEGMENT = "segment"
+CONF_DEVICE_ID = "device_id"
+CONF_ENTITY_ID = "entity_id"
+CONF_MODE = "mode"
+CONF_NAME = "name"
+CONF_SENSITIVITY = "sensitivity"
+CONF_AUTO_COLOR = "auto_color"
+CONF_EFFECT = "effect"
+CONF_SPEED = "speed"
+CONF_BRIGHTNESS = "brightness"
+CONF_COLOR = "color"
