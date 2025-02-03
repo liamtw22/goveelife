@@ -1,15 +1,13 @@
 """Humidifier entities for the Govee Life integration."""
 
 from __future__ import annotations
-from typing import Final, Any
+from typing import Final
 import logging
 import asyncio
-from functools import partial
 
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers import entity_platform
 from homeassistant.components.humidifier import (
     HumidifierDeviceClass,
     HumidifierEntity,
@@ -19,261 +17,271 @@ from homeassistant.const import (
     CONF_DEVICES,
     STATE_ON,
     STATE_OFF,
-    PERCENTAGE,
-    ATTR_MODE,
+    STATE_UNKNOWN,
 )
-from homeassistant.exceptions import HomeAssistantError
 
 from .entities import GoveeLifePlatformEntity
-from .const import (
-    DOMAIN,
-    CONF_COORDINATORS,
-    CONF_API_CLIENT,
-    SERVICE_WATER_FULL_RESET
-)
-from .utils import (
-    GoveeAPI_GetCachedStateValue,
-    async_GoveeAPI_ControlDevice,
-    govee_error_retry,
-)
+from .const import DOMAIN, CONF_COORDINATORS
+from .utils import GoveeAPI_GetCachedStateValue, async_GoveeAPI_ControlDevice
 
 _LOGGER: Final = logging.getLogger(__name__)
-platform = 'humidifier'
-platform_device_types = [
+PLATFORM = 'humidifier'
+PLATFORM_DEVICE_TYPES = [
     'devices.types.humidifier',
     'devices.types.dehumidifier'
 ]
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback):
-    """Set up humidifier platform with services."""
-    entry_data = hass.data[DOMAIN][entry.entry_id]
-    api = entry_data[CONF_API_CLIENT]
-    
-    # Register humidifier services
-    async def handle_water_full_reset(call: ServiceCall):
-        await api.control_device(
-            call.data["entity_id"],
-            [{"command": "waterFullEvent", "value": 0}]
-        )
+MODE_ICONS = {
+    'Low': 'mdi:fan-speed-1',
+    'Medium': 'mdi:fan-speed-2',
+    'High': 'mdi:fan-speed-3',
+    'Sleep': 'mdi:power-sleep',
+    'Auto': 'mdi:autorenew',
+    'Dryer': 'mdi:tumble-dryer',
+    'Custom': 'mdi:cog-outline'
+}
 
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_WATER_FULL_RESET,
-        handle_water_full_reset,
-        schema=vol.Schema({
-            vol.Required("entity_id"): cv.entity_id
-        })
-    )
-
-    # Entity setup
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
+    """Set up humidifier platform with advanced Govee API support."""
     entities = []
-    for device_cfg in entry_data[CONF_DEVICES]:
-        if device_cfg.get('type') in platform_device_types:
-            try:
-                coordinator = entry_data[CONF_COORDINATORS][device_cfg['device']]
-                entity = GoveeHumidifier(hass, entry, coordinator, device_cfg)
-                entities.append(entity)
-            except Exception as e:
-                _LOGGER.error("Error creating humidifier entity: %s", str(e))
-    
-    async_add_entities(entities, True)
 
-class GoveeHumidifier(HumidifierEntity, GoveeLifePlatformEntity):
-    """Advanced Govee Humidifier/Dehumidifier Entity"""
-    
-    _attr_has_entity_name = True
-    _attr_supported_features = HumidifierEntityFeature.MODES
-    _enable_turn_on_off_backwards_compatibility = False
+    try:
+        entry_data = hass.data[DOMAIN][entry.entry_id]
+        api_devices = entry_data[CONF_DEVICES]
+    except Exception as e:
+        _LOGGER.error("%s - async_setup_entry %s: Failed to get devices: %s (%s.%s)",
+                     entry.entry_id, PLATFORM, str(e), e.__class__.__module__, type(e).__name__)
+        return
+
+    for device_cfg in api_devices:
+        if device_cfg.get('type') not in PLATFORM_DEVICE_TYPES:
+            continue
+
+        device = device_cfg.get('device')
+        coordinator = entry_data[CONF_COORDINATORS][device]
+        entity = GoveeLifeHumidifier(hass, entry, coordinator, device_cfg, platform=PLATFORM)
+        entities.append(entity)
+        await asyncio.sleep(0)
+
+    if entities:
+        async_add_entities(entities)
+
+class GoveeLifeHumidifier(HumidifierEntity, GoveeLifePlatformEntity):
+    """Humidifier class for Govee Life integration."""
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, coordinator, device_cfg, **kwargs):
+        """Initialize the humidifier entity."""
+        self._attr_available_modes = []
+        self._attr_mode = None
+        self._attr_supported_features = HumidifierEntityFeature.MODES
+        self._attr_min_humidity = 30
+        self._attr_max_humidity = 80
+        self._attr_target_humidity = None
+        self._attr_current_humidity = None
+        self._attr_extra_state_attributes = {}
+        self._state_mapping = {}
+        self._state_mapping_set = {}
+        self._modes_mapping = {}
+        
+        super().__init__(hass, entry, coordinator, device_cfg, **kwargs)
+
+        # Set up event listener
+        hass.bus.async_listen(f"{DOMAIN}_event", self._handle_event)
+
+    @callback
+    def _handle_event(self, event):
+        """Handle device events."""
+        if event.data.get('device') != self._device_cfg.get('device'):
+            return
+            
+        try:
+            if 'waterFullEvent' in event.data:
+                is_full = bool(event.data['waterFullEvent'])
+                self._attr_extra_state_attributes['water_full'] = is_full
+                if is_full:
+                    _LOGGER.warning("%s - Water tank is full", self._identifier)
+                self.async_write_ha_state()
+        except Exception as e:
+            _LOGGER.error("%s - Failed to handle event: %s", self._identifier, str(e))
 
     def _init_platform_specific(self, **kwargs):
-        """Initialize humidifier-specific capabilities."""
-        self._commands = {}
-        self._water_full = False
-        self._filter_life = None
-        self._air_quality = None
-        
-        for cap in self._device_cfg.get('capabilities', []):
-            self._process_capability(cap)
+        """Initialize platform-specific capabilities."""
+        capabilities = self._device_cfg.get('capabilities', [])
         
         # Set device class based on type
         self._attr_device_class = (
-            HumidifierDeviceClass.DEHUMIDIFIER 
-            if "dehumidifier" in self._device_cfg.get('type', '')
-            else HumidifierDeviceClass.HUMIDIFIER
+            HumidifierDeviceClass.DEHUMIDIFIER if 
+            'dehumidifier' in self._device_cfg.get('type', '') else
+            HumidifierDeviceClass.HUMIDIFIER
         )
 
-    def _process_capability(self, cap: dict):
-        """Process device capabilities."""
-        instance = cap.get('instance', '')
-        
-        if cap['type'] == 'devices.capabilities.on_off':
-            self._map_power_states(cap)
-        
-        elif cap['type'] == 'devices.capabilities.work_mode':
-            self._process_work_mode(cap)
-        
-        elif cap['type'] == 'devices.capabilities.range' and instance == "humidity":
-            self._setup_humidity_range(cap)
-        
-        elif cap['type'] == 'devices.capabilities.property':
-            if instance == "filterLifeTime":
-                self._commands["filter"] = partial(
-                    self._send_filter_command,
-                    instance=instance
-                )
-            elif instance == "airQuality":
-                self._commands["air_quality"] = partial(
-                    self._send_air_quality_command,
-                    instance=instance
-                )
-        
-        elif cap['type'] == 'devices.capabilities.event' and instance == "waterFullEvent":
-            self._commands["water_reset"] = partial(
-                self._send_water_reset_command,
-                instance=instance
-            )
+        for cap in capabilities:
+            try:
+                if cap['type'] == 'devices.capabilities.on_off':
+                    self._handle_power_capability(cap)
+                elif cap['type'] == 'devices.capabilities.range':
+                    self._handle_range_capability(cap)
+                elif cap['type'] == 'devices.capabilities.work_mode':
+                    self._handle_work_mode_capability(cap)
+                elif cap['type'] == 'devices.capabilities.event':
+                    self._handle_event_capability(cap)
+            except Exception as e:
+                _LOGGER.warning("%s - Capability init failed: %s (%s)", self._identifier, str(e), cap)
 
-    def _process_work_mode(self, cap: dict):
-        """Process work mode capability structure."""
-        self._attr_available_modes = []
-        self._mode_mapping = {}
-        
-        for field in cap.get('parameters', {}).get('fields', []):
-            if field['fieldName'] == 'workMode':
-                for option in field.get('options', []):
-                    mode_name = option['name']
-                    self._attr_available_modes.append(mode_name)
-                    self._mode_mapping[mode_name] = {
-                        'workMode': option['value'],
-                        'modeValue': None
-                    }
-            
-            elif field['fieldName'] == 'modeValue':
-                for value_opt in field.get('options', []):
-                    if value_opt.get('options'):
-                        # Nested gear modes
-                        for gear_opt in value_opt['options']:
-                            mode_name = gear_opt['name']
-                            self._attr_available_modes.append(mode_name)
-                            self._mode_mapping[mode_name] = {
-                                'workMode': self._mode_mapping[value_opt['name']]['workMode'],
-                                'modeValue': gear_opt['value']
+    def _handle_power_capability(self, cap):
+        """Handle power control capability."""
+        for option in cap['parameters']['options']:
+            if option['name'] == 'on':
+                self._state_mapping[option['value']] = STATE_ON
+                self._state_mapping_set[STATE_ON] = option['value']
+            elif option['name'] == 'off':
+                self._state_mapping[option['value']] = STATE_OFF
+                self._state_mapping_set[STATE_OFF] = option['value']
+
+    def _handle_range_capability(self, cap):
+        """Handle humidity range capability."""
+        if cap['instance'] == 'humidity':
+            self._attr_min_humidity = cap['parameters']['range']['min']
+            self._attr_max_humidity = cap['parameters']['range']['max']
+
+    def _handle_work_mode_capability(self, cap):
+        """Handle advanced work mode configurations."""
+        if cap['instance'] == 'workMode':
+            # Process work mode fields
+            for field in cap['parameters']['fields']:
+                if field['fieldName'] == 'workMode':
+                    for mode in field['options']:
+                        if mode['name'] == 'gearMode':
+                            # Handle gear modes
+                            mode_options = next(
+                                (f['options'] for f in cap['parameters']['fields'] 
+                                if f['fieldName'] == 'modeValue' 
+                                and 'gearMode' in str(f)), []
+                            )
+                            if mode_options:
+                                for gear in mode_options[0].get('options', []):
+                                    base_name = gear['name']
+                                    if base_name not in self._attr_available_modes:
+                                        self._attr_available_modes.append(base_name)
+                                    
+                                    self._modes_mapping[base_name] = {
+                                        'workMode': mode['value'],
+                                        'modeValue': gear['value'],
+                                    }
+                        else:
+                            # Handle other modes
+                            base_name = mode['name']
+                            if base_name not in self._attr_available_modes:
+                                self._attr_available_modes.append(base_name)
+                            self._modes_mapping[base_name] = {
+                                'workMode': mode['value'],
+                                'modeValue': 0,
                             }
-                    else:
-                        # Direct mode values
-                        mode_name = value_opt['name']
-                        self._attr_available_modes.append(mode_name)
-                        self._mode_mapping[mode_name] = {
-                            'workMode': self._mode_mapping[value_opt['name']]['workMode'],
-                            'modeValue': value_opt.get('value', 0)
-                        }
 
-    @govee_error_retry
-    async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn the device on with optional mode setting."""
-        commands = []
-        
-        if not self.is_on:
-            commands.append(self._create_power_command(STATE_ON))
-        
-        if ATTR_MODE in kwargs:
-            commands.append(self._create_mode_command(kwargs[ATTR_MODE]))
-        
-        if commands:
-            await async_GoveeAPI_ControlDevice(
-                self.hass,
-                self._entry_id,
-                self._device_cfg,
-                commands
-            )
+    def _handle_event_capability(self, cap):
+        """Handle water full events."""
+        if cap['instance'] == 'waterFullEvent':
+            self._attr_extra_state_attributes['water_full'] = False
+            if 'eventState' in cap and 'options' in cap['eventState']:
+                for option in cap['eventState']['options']:
+                    if option['name'] == 'waterFull':
+                        self._attr_extra_state_attributes['water_full_message'] = option['message']
+
+    @property
+    def available_modes(self) -> list[str] | None:
+        """Return the list of available modes."""
+        return self._attr_available_modes
+
+    @property
+    def mode(self) -> str | None:
+        """Return current mode."""
+        work_mode = GoveeAPI_GetCachedStateValue(
+            self.hass, self._entry_id, self._device_cfg['device'],
+            'devices.capabilities.work_mode', 'workMode'
+        )
+        if not work_mode:
+            return None
+
+        # Find mode name from mapping
+        for mode_name, values in self._modes_mapping.items():
+            if (values['workMode'] == work_mode.get('workMode') and 
+                values['modeValue'] == work_mode.get('modeValue', 0)):
+                return mode_name
+        return None
+
+    def option_icon(self, option: str) -> str | None:
+        """Return the icon for the provided option."""
+        return MODE_ICONS.get(option)
+
+    async def async_set_mode(self, mode: str) -> None:
+        """Set new mode."""
+        if mode not in self._modes_mapping:
+            _LOGGER.error("%s - Invalid mode: %s", self._identifier, mode)
+            return
+
+        mode_config = self._modes_mapping[mode]
+        capability = {
+            "type": "devices.capabilities.work_mode",
+            "instance": "workMode",
+            "value": {
+                "workMode": mode_config['workMode'],
+                "modeValue": mode_config['modeValue']
+            }
+        }
+
+        if await async_GoveeAPI_ControlDevice(self.hass, self._entry_id, self._device_cfg, capability):
             self.async_write_ha_state()
 
-    async def async_turn_off(self, **kwargs: Any) -> None:
-        """Turn the device off."""
-        await self._execute_command(self._create_power_command(STATE_OFF))
+    @property
+    def target_humidity(self) -> int | None:
+        """Return target humidity setting."""
+        return GoveeAPI_GetCachedStateValue(
+            self.hass, self._entry_id, self._device_cfg['device'],
+            'devices.capabilities.range', 'humidity'
+        )
 
     async def async_set_humidity(self, humidity: int) -> None:
-        """Set target humidity."""
-        await self._execute_command({
+        """Set new target humidity."""
+        if humidity < self._attr_min_humidity or humidity > self._attr_max_humidity:
+            _LOGGER.warning("%s - Invalid humidity value: %s", self._identifier, humidity)
+            return
+
+        capability = {
             "type": "devices.capabilities.range",
             "instance": "humidity",
             "value": humidity
-        })
-
-    async def async_set_mode(self, mode: str) -> None:
-        """Set device operation mode."""
-        await self._execute_command(self._create_mode_command(mode))
-
-    def _create_power_command(self, state: str) -> dict:
-        return {
-            "type": "devices.capabilities.on_off",
-            "instance": "powerSwitch",
-            "value": self._state_mapping_set[state]
         }
-
-    def _create_mode_command(self, mode: str) -> dict:
-        mode_data = self._mode_mapping.get(mode)
-        if not mode_data:
-            raise HomeAssistantError(f"Invalid mode: {mode}")
         
-        return {
-            "type": "devices.capabilities.work_mode",
-            "instance": "workMode",
-            "value": mode_data
-        }
-
-    async def _execute_command(self, command: dict):
-        """Execute single command with error handling."""
-        success = await async_GoveeAPI_ControlDevice(
-            self.hass,
-            self._entry_id,
-            self._device_cfg,
-            [command]
-        )
-        if success:
+        if await async_GoveeAPI_ControlDevice(self.hass, self._entry_id, self._device_cfg, capability):
             self.async_write_ha_state()
 
     @property
-    def target_humidity(self) -> int:
-        """Return current target humidity."""
-        return GoveeAPI_GetCachedStateValue(
-            self.hass,
-            self._entry_id,
-            self.device_id,
-            "devices.capabilities.range",
-            "humidity"
+    def is_on(self) -> bool:
+        """Return true if humidifier is on."""
+        value = GoveeAPI_GetCachedStateValue(
+            self.hass, self._entry_id, self._device_cfg['device'],
+            'devices.capabilities.on_off', 'powerSwitch'
         )
+        return self._state_mapping.get(value) == STATE_ON
 
-    @property
-    def current_humidity(self) -> float:
-        """Return current ambient humidity."""
-        return GoveeAPI_GetCachedStateValue(
-            self.hass,
-            self._entry_id,
-            self.device_id,
-            "devices.capabilities.property",
-            "humidity"
-        )
-
-    @property
-    def extra_state_attributes(self) -> dict:
-        """Return device-specific state attributes."""
-        return {
-            "filter_life": self._filter_life,
-            "air_quality": self._air_quality,
-            "water_full": self._water_full
+    async def async_turn_on(self, **kwargs) -> None:
+        """Turn the humidifier on."""
+        capability = {
+            "type": "devices.capabilities.on_off",
+            "instance": "powerSwitch",
+            "value": self._state_mapping_set[STATE_ON]
         }
+        
+        if await async_GoveeAPI_ControlDevice(self.hass, self._entry_id, self._device_cfg, capability):
+            self.async_write_ha_state()
 
-    async def async_update(self) -> None:
-        """Update entity state from coordinator data."""
-        await self._coordinator.async_request_refresh()
-        device_data = self._coordinator.data.get(self.device_id, {})
+    async def async_turn_off(self, **kwargs) -> None:
+        """Turn the humidifier off."""
+        capability = {
+            "type": "devices.capabilities.on_off",
+            "instance": "powerSwitch",
+            "value": self._state_mapping_set[STATE_OFF]
+        }
         
-        # Update core states
-        self._attr_is_on = device_data.get('powerState') == STATE_ON
-        self._attr_mode = device_data.get('currentMode')
-        self._water_full = device_data.get('waterFull', False)
-        
-        # Update additional sensors
-        self._filter_life = device_data.get('filterLife')
-        self._air_quality = device_data.get('airQuality')
+        if await async_GoveeAPI_ControlDevice(self.hass, self._entry_id, self._device_cfg, capability):
+            self.async_write_ha_state()
