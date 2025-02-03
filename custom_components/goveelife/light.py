@@ -1,25 +1,17 @@
 """Light entities for the Govee Life integration."""
 
 from __future__ import annotations
-from typing import Final, Any
+from typing import Final
 import logging
 import asyncio
-import math
-from functools import partial
 
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers.entity_platform import AddEntitiesCallback, async_call_later
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.util.color import (
-    brightness_to_value, 
-    value_to_brightness,
-    color_temperature_kelvin_to_mired,
-    color_temperature_mired_to_kelvin
-)
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_COLOR_TEMP_KELVIN,
+    ATTR_EFFECT,
     ATTR_RGB_COLOR,
     ColorMode,
     LightEntity,
@@ -31,272 +23,323 @@ from homeassistant.const import (
     STATE_OFF,
     STATE_UNKNOWN,
 )
-from homeassistant.exceptions import HomeAssistantError
 
 from .entities import GoveeLifePlatformEntity
-from .const import (
-    DOMAIN, 
-    CONF_COORDINATORS,
-    CONF_API_CLIENT,
-    SCAN_INTERVAL
-)
-from .utils import (
-    GoveeAPI_GetCachedStateValue,
-    async_GoveeAPI_ControlDevice,
-    govee_error_retry,
-)
+from .const import DOMAIN, CONF_COORDINATORS
+from .utils import GoveeAPI_GetCachedStateValue, async_GoveeAPI_ControlDevice
 
 _LOGGER: Final = logging.getLogger(__name__)
-platform = 'light'
-platform_device_types = ['devices.types.light']
+PLATFORM = 'light'
+PLATFORM_DEVICE_TYPES = ['devices.types.light']
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback):
-    """Set up the light platform with services."""
-    _LOGGER.debug("Setting up %s platform entry: %s", platform, entry.entry_id)
-    entry_data = hass.data[DOMAIN][entry.entry_id]
-    api = entry_data[CONF_API_CLIENT]
-    
-    # Register light services
-    async def handle_set_segment_color(call: ServiceCall):
-        await api.control_device(
-            call.data["entity_id"],
-            [{
-                "command": "segmentedColorRgb",
-                "value": {
-                    "segment": call.data["segments"],
-                    "rgb": (call.data["rgb"][0] << 16) + 
-                           (call.data["rgb"][1] << 8) + 
-                            call.data["rgb"][2]
-                }
-            }]
-        )
+def brightness_to_value(scale: tuple[int, int], brightness: int) -> int:
+    """Convert Home Assistant brightness (0-255) to device value."""
+    min_value, max_value = scale
+    return round(((max_value - min_value) * (brightness / 255)) + min_value)
 
-    hass.services.async_register(
-        DOMAIN,
-        "set_segment_color",
-        handle_set_segment_color,
-        schema=vol.Schema({
-            vol.Required("entity_id"): cv.entity_id,
-            vol.Required("segments"): [int],
-            vol.Required("rgb"): [int, int, int]
-        })
-    )
+def value_to_brightness(scale: tuple[int, int], value: int | None) -> int | None:
+    """Convert device value to Home Assistant brightness (0-255)."""
+    if value is None:
+        return None
+    min_value, max_value = scale
+    return round(((value - min_value) / (max_value - min_value)) * 255)
 
-    # Existing entity setup code...
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
+    """Set up the light platform with Govee API support."""
+    _LOGGER.debug("Setting up %s platform entry: %s | %s", PLATFORM, DOMAIN, entry.entry_id)
     entities = []
-    for device_cfg in entry_data[CONF_DEVICES]:
-        if device_cfg.get('type') in platform_device_types:
-            try:
-                coordinator = entry_data[CONF_COORDINATORS][device_cfg['device']]
-                entity = GoveeLifeLight(hass, entry, coordinator, device_cfg)
-                entities.append(entity)
-            except Exception as e:
-                _LOGGER.error("Error creating light entity: %s", str(e))
-    
-    async_add_entities(entities, True)
+
+    try:
+        entry_data = hass.data[DOMAIN][entry.entry_id]
+        api_devices = entry_data[CONF_DEVICES]
+    except Exception as e:
+        _LOGGER.error("%s - async_setup_entry %s: Failed to get devices: %s (%s.%s)",
+                     entry.entry_id, PLATFORM, str(e), e.__class__.__module__, type(e).__name__)
+        return
+
+    for device_cfg in api_devices:
+        try:
+            if device_cfg.get('type') not in PLATFORM_DEVICE_TYPES:
+                continue
+
+            device = device_cfg.get('device')
+            coordinator = entry_data[CONF_COORDINATORS][device]
+            entity = GoveeLifeLight(hass, entry, coordinator, device_cfg, platform=PLATFORM)
+            entities.append(entity)
+            await asyncio.sleep(0)
+        except Exception as e:
+            _LOGGER.error("%s - async_setup_entry %s: Setup failed: %s (%s.%s)",
+                         entry.entry_id, PLATFORM, str(e), e.__class__.__module__, type(e).__name__)
+
+    if entities:
+        async_add_entities(entities)
 
 class GoveeLifeLight(LightEntity, GoveeLifePlatformEntity):
-    """Advanced Govee Light Entity with full capability support."""
+    """Advanced light implementation with Govee API support."""
     
-    _attr_has_entity_name = True
-    _attr_supported_features = LightEntityFeature.EFFECT
-    _enable_turn_on_off_backwards_compatibility = False
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, coordinator, device_cfg, **kwargs):
+        """Initialize the light entity."""
+        # Initialize all attributes before super().__init__
+        self._attr_supported_color_modes = {ColorMode.ONOFF}
+        self._attr_color_mode = ColorMode.ONOFF
+        self._attr_effect_list = []
+        self._scene_modes = {}
+        self._music_modes = {}
+        self._attr_supported_features = LightEntityFeature(0)
+        self._brightness_scale = (1, 100)  # Default brightness range
+        self._state_mapping = {}
+        self._state_mapping_set = {}
+        
+        # Set default color temperature range
+        self._attr_min_color_temp_kelvin = 2000
+        self._attr_max_color_temp_kelvin = 9000
+        
+        super().__init__(hass, entry, coordinator, device_cfg, **kwargs)
+        
+        # Initial set of scenes
+        self._set_default_scenes()
+
+    def _set_default_scenes(self):
+        """Set the default scene list."""
+        scenes = [
+            ("Sunrise", 196, 177), ("Sunset", 197, 178), ("Rainbow", 198, 179),
+            ("Sunset Glow", 199, 180), ("Snow flake", 200, 181), ("Aurora", 201, 182),
+            ("Forest", 202, 183), ("Ocean", 203, 184), ("Waves", 204, 185),
+            ("Fire", 205, 186), ("Dark Clouds", 2457, 2565), ("Morning", 730, 784),
+            ("Firefly", 2458, 2568), ("Sky", 731, 785), ("Flowing Light", 2459, 2569),
+            ("Flower Field", 732, 786), ("Dense fog", 733, 787), ("Lightning", 734, 788),
+            ("Falling Petals", 735, 789), ("Feather", 736, 790), ("Reading", 206, 187),
+            ("Night Light", 207, 188), ("Fish tank", 208, 189), ("Graffiti", 209, 190),
+            ("Cherry Blossom Festival", 210, 191), ("Eating Dots", 2460, 2570),
+            ("Marshmallow", 2463, 2567), ("Goldfish", 737, 791), ("Geometry", 738, 792),
+            ("Kaleidoscope", 739, 793), ("Rubik's Cube", 740, 794), ("Train", 741, 795),
+            ("Kitchen Aromas", 742, 796), ("Rings", 743, 797), ("Dancing", 211, 192),
+            ("Breathe", 212, 193), ("Gradient", 213, 194), ("Cheerful", 214, 195),
+            ("Sweet", 215, 196), ("Heartbeat", 2462, 2571), ("Leisure", 744, 798),
+            ("Healing", 745, 799), ("Dreamland", 746, 800)
+        ]
+        
+        for name, scene_id, param_id in scenes:
+            self._scene_modes[name] = {"id": scene_id, "paramId": param_id}
+            if name not in self._attr_effect_list:
+                self._attr_effect_list.append(name)
 
     def _init_platform_specific(self, **kwargs):
-        """Initialize light-specific capabilities."""
-        self._commands = {}
-        self._effect_list = []
-        self._segmented_capable = False
-        self._music_mode_capable = False
+        """Initialize platform-specific capabilities."""
+        capabilities = self._device_cfg.get('capabilities', [])
         
-        for cap in self._device_cfg.get('capabilities', []):
-            self._process_capability(cap)
-        
-        self._update_color_modes()
-        
-    def _process_capability(self, cap: dict):
-        """Process individual device capabilities."""
-        instance = cap.get('instance', '')
-        
-        # Power state mapping
-        if cap['type'] == 'devices.capabilities.on_off':
-            self._map_power_states(cap)
-        
-        # Brightness handling
-        elif cap['type'] == 'devices.capabilities.range' and instance == "brightness":
-            self._setup_brightness(cap)
-        
-        # Color capabilities
-        elif cap['type'] == 'devices.capabilities.color_setting':
-            if instance == "colorRgb":
-                self._setup_rgb_color(cap)
-            elif instance == "colorTemperatureK":
-                self._setup_color_temp(cap)
-        
-        # Segmented controls
-        elif cap['type'] == 'devices.capabilities.segment_color_setting':
-            self._segmented_capable = True
-            self._commands["segment"] = partial(
-                self._send_segment_command,
-                instance=instance,
-                struct_fields=cap['parameters']['fields']
-            )
-        
-        # Scene management
-        elif cap['type'] == 'devices.capabilities.dynamic_scene':
-            self._effect_list.extend([
-                opt['name'] for opt in cap.get('parameters', {}).get('options', [])
-            ])
-        
-        # Music mode
-        elif cap['type'] == 'devices.capabilities.music_setting' and instance == "musicMode":
-            self._music_mode_capable = True
-            self._commands["music"] = partial(
-                self._send_music_command,
-                struct_fields=cap['parameters']['fields']
-            )
+        for cap in capabilities:
+            try:
+                if cap['type'] == 'devices.capabilities.on_off':
+                    self._handle_power_capability(cap)
+                elif cap['type'] == 'devices.capabilities.range':
+                    self._handle_range_capability(cap)
+                elif cap['type'] == 'devices.capabilities.color_setting':
+                    self._handle_color_capability(cap)
+                elif cap['type'] == 'devices.capabilities.music_setting':
+                    self._handle_music_capability(cap)
+            except Exception as e:
+                _LOGGER.warning("%s - Capability init failed: %s (%s)", self._identifier, str(e), cap)
 
-    def _update_color_modes(self):
-        """Determine supported color modes according to HA guidelines."""
-        color_modes = {ColorMode.ONOFF}
-        
-        if ColorMode.RGB in self._attr_supported_color_modes:
-            color_modes.add(ColorMode.RGB)
-        if ColorMode.COLOR_TEMP in self._attr_supported_color_modes:
-            color_modes.add(ColorMode.COLOR_TEMP)
-        if ColorMode.BRIGHTNESS in self._attr_supported_color_modes:
-            color_modes.add(ColorMode.BRIGHTNESS)
-        
-        # HA requires specifying a single color mode if multiple are supported
-        if len(color_modes) > 1:
-            color_modes.discard(ColorMode.ONOFF)
-        self._attr_supported_color_modes = color_modes
+    def _handle_power_capability(self, cap):
+        """Handle power control capability."""
+        for option in cap['parameters']['options']:
+            if option['name'] == 'on':
+                self._state_mapping[option['value']] = STATE_ON
+                self._state_mapping_set[STATE_ON] = option['value']
+            elif option['name'] == 'off':
+                self._state_mapping[option['value']] = STATE_OFF
+                self._state_mapping_set[STATE_OFF] = option['value']
 
-    @govee_error_retry
-    async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn the light on with advanced command batching."""
+    def _handle_range_capability(self, cap):
+        """Handle brightness range capability."""
+        if cap['instance'] == 'brightness':
+            self._brightness_scale = (
+                cap['parameters']['range']['min'],
+                cap['parameters']['range']['max']
+            )
+            if ColorMode.ONOFF in self._attr_supported_color_modes:
+                self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
+            else:
+                self._attr_supported_color_modes.add(ColorMode.BRIGHTNESS)
+
+    def _handle_color_capability(self, cap):
+        """Handle color capabilities."""
+        if cap['instance'] == 'colorRgb':
+            self._attr_supported_color_modes.add(ColorMode.RGB)
+            if ColorMode.COLOR_TEMP not in self._attr_supported_color_modes:
+                self._attr_color_mode = ColorMode.RGB
+                
+        elif cap['instance'] == 'colorTemperatureK':
+            self._attr_supported_color_modes.add(ColorMode.COLOR_TEMP)
+            if ColorMode.RGB not in self._attr_supported_color_modes:
+                self._attr_color_mode = ColorMode.COLOR_TEMP
+                
+            self._attr_min_color_temp_kelvin = cap['parameters']['range']['min']
+            self._attr_max_color_temp_kelvin = cap['parameters']['range']['max']
+            _LOGGER.debug("%s - Color temperature range: %d-%d K", self._identifier,
+                         self._attr_min_color_temp_kelvin, self._attr_max_color_temp_kelvin)
+
+    def _handle_music_capability(self, cap):
+        """Handle music mode capabilities."""
+        if cap['instance'] == 'musicMode':
+            self._attr_supported_features |= LightEntityFeature.EFFECT
+            for field in cap['parameters']['fields']:
+                if field['fieldName'] == 'musicMode':
+                    for option in field['options']:
+                        mode_name = f"Music: {option['name']}"
+                        if mode_name not in self._attr_effect_list:
+                            self._attr_effect_list.append(mode_name)
+                        self._music_modes[mode_name] = {
+                            "musicMode": option['value'],
+                            "sensitivity": 50,
+                            "autoColor": 1
+                        }
+
+    @property
+    def effect_list(self) -> list[str] | None:
+        """Return the list of supported effects."""
+        return self._attr_effect_list
+
+    @property
+    def effect(self) -> str | None:
+        """Return the current effect."""
+        # First check for scene
+        scene = GoveeAPI_GetCachedStateValue(
+            self.hass, self._entry_id, self._device_cfg['device'],
+            'devices.capabilities.dynamic_scene', 'lightScene'
+        )
+        
+        if scene:
+            scene_id = scene.get('id') if isinstance(scene, dict) else None
+            if scene_id:
+                for name, value in self._scene_modes.items():
+                    if value.get('id') == scene_id:
+                        return name
+
+        # Then check for music mode
+        music = GoveeAPI_GetCachedStateValue(
+            self.hass, self._entry_id, self._device_cfg['device'],
+            'devices.capabilities.music_setting', 'musicMode'
+        )
+        if music:
+            mode_value = music.get('musicMode')
+            for name, config in self._music_modes.items():
+                if config['musicMode'] == mode_value:
+                    return name
+
+        return None
+
+    @property
+    def brightness(self) -> int | None:
+        """Return the brightness of this light between 0..255."""
+        value = GoveeAPI_GetCachedStateValue(
+            self.hass, self._entry_id, self._device_cfg['device'],
+            'devices.capabilities.range', 'brightness'
+        )
+        return value_to_brightness(self._brightness_scale, value)
+
+    @property
+    def rgb_color(self) -> tuple[int, int, int] | None:
+        """Return the rgb color value [int, int, int]."""
+        value = GoveeAPI_GetCachedStateValue(
+            self.hass, self._entry_id, self._device_cfg['device'],
+            'devices.capabilities.color_setting', 'colorRgb'
+        )
+        if value is None:
+            return None
+        return (
+            (value >> 16) & 0xFF,
+            (value >> 8) & 0xFF,
+            value & 0xFF
+        )
+
+    @property
+    def color_temp_kelvin(self) -> int | None:
+        """Return the color temperature in Kelvin."""
+        return GoveeAPI_GetCachedStateValue(
+            self.hass, self._entry_id, self._device_cfg['device'],
+            'devices.capabilities.color_setting', 'colorTemperatureK'
+        )
+
+    @property
+    def is_on(self) -> bool:
+        """Return true if light is on."""
+        value = GoveeAPI_GetCachedStateValue(
+            self.hass, self._entry_id, self._device_cfg['device'],
+            'devices.capabilities.on_off', 'powerSwitch'
+        )
+        return self._state_mapping.get(value) == STATE_ON
+
+    async def async_turn_on(self, **kwargs) -> None:
+        """Turn the light on."""
         commands = []
-        should_power_on = not self.is_on
         
-        # Build command sequence
-        if should_power_on:
-            commands.append(self._create_power_command(STATE_ON))
-        
+        # Handle brightness
         if ATTR_BRIGHTNESS in kwargs:
-            commands.append(self._create_brightness_command(kwargs[ATTR_BRIGHTNESS]))
-        
-        if ATTR_RGB_COLOR in kwargs:
-            commands.append(self._create_rgb_command(kwargs[ATTR_RGB_COLOR]))
-        
+            commands.append({
+                "type": "devices.capabilities.range",
+                "instance": "brightness",
+                "value": brightness_to_value(self._brightness_scale, kwargs[ATTR_BRIGHTNESS])
+            })
+            
+        # Handle color temperature
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
-            commands.append(self._create_color_temp_command(kwargs[ATTR_COLOR_TEMP_KELVIN]))
+            commands.append({
+                "type": "devices.capabilities.color_setting",
+                "instance": "colorTemperatureK",
+                "value": kwargs[ATTR_COLOR_TEMP_KELVIN]
+            })
+            
+        # Handle RGB color
+        if ATTR_RGB_COLOR in kwargs:
+            rgb = kwargs[ATTR_RGB_COLOR]
+            rgb_value = (rgb[0] << 16) + (rgb[1] << 8) + rgb[2]
+            commands.append({
+                "type": "devices.capabilities.color_setting",
+                "instance": "colorRgb",
+                "value": rgb_value
+            })
+            
+        # Handle effect
+        if ATTR_EFFECT in kwargs:
+            effect = kwargs[ATTR_EFFECT]
+            
+            if effect.startswith("Music:") and effect in self._music_modes:
+                commands.append({
+                    "type": "devices.capabilities.music_setting",
+                    "instance": "musicMode",
+                    "value": self._music_modes[effect]
+                })
+            elif effect in self._scene_modes:
+                commands.append({
+                    "type": "devices.capabilities.dynamic_scene",
+                    "instance": "lightScene",
+                    "value": self._scene_modes[effect]
+                })
         
-        # Execute all commands in single API call
-        if commands:
-            await async_GoveeAPI_ControlDevice(
-                self.hass,
-                self._entry_id,
-                self._device_cfg,
-                commands
-            )
-            self.async_write_ha_state()
+        # Always include power on command last if needed
+        if not self.is_on or not commands:
+            commands.append({
+                "type": "devices.capabilities.on_off",
+                "instance": "powerSwitch",
+                "value": self._state_mapping_set[STATE_ON]
+            })
+        
+        # Execute all commands
+        for command in commands:
+            _LOGGER.debug("%s - Sending command: %s", self._identifier, command)
+            if await async_GoveeAPI_ControlDevice(self.hass, self._entry_id, self._device_cfg, command):
+                self.async_write_ha_state()
+            await asyncio.sleep(0.1)  # Small delay between commands
 
-    def _create_power_command(self, state: str) -> dict:
-        return {
+    async def async_turn_off(self, **kwargs) -> None:
+        """Turn the light off."""
+        command = {
             "type": "devices.capabilities.on_off",
             "instance": "powerSwitch",
-            "value": self._state_mapping_set[state]
+            "value": self._state_mapping_set[STATE_OFF]
         }
-
-    def _create_brightness_command(self, brightness: int) -> dict:
-        return {
-            "type": "devices.capabilities.range",
-            "instance": "brightness",
-            "value": math.ceil(brightness_to_value(self._brightness_scale, brightness))
-        }
-
-    def _create_rgb_command(self, rgb: tuple) -> dict:
-        return {
-            "type": "devices.capabilities.color_setting",
-            "instance": "colorRgb",
-            "value": (rgb[0] << 16) + (rgb[1] << 8) + rgb[2]
-        }
-
-    def _create_color_temp_command(self, kelvin: int) -> dict:
-        return {
-            "type": "devices.capabilities.color_setting",
-            "instance": "colorTemperatureK",
-            "value": min(max(kelvin, self._attr_min_color_temp_kelvin), 
-                       self._attr_max_color_temp_kelvin)
-        }
-
-    async def _send_segment_command(self, segments: list[int], rgb: tuple[int,int,int], **kwargs):
-        """Handle segmented color control."""
-        command = {
-            "type": "devices.capabilities.segment_color_setting",
-            "instance": kwargs.get('instance', 'segmentedColorRgb'),
-            "value": {
-                "segment": segments,
-                "rgb": (rgb[0] << 16) + (rgb[1] << 8) + rgb[2]
-            }
-        }
-        return await async_GoveeAPI_ControlDevice(
-            self.hass,
-            self._entry_id,
-            self._device_cfg,
-            [command]
-        )
-
-    async def _send_music_command(self, mode: str, sensitivity: int, **kwargs):
-        """Handle music mode activation."""
-        command = {
-            "type": "devices.capabilities.music_setting",
-            "instance": "musicMode",
-            "value": {
-                "musicMode": mode,
-                "sensitivity": sensitivity,
-                "autoColor": 1  # Default to auto-color unless specified
-            }
-        }
-        return await async_GoveeAPI_ControlDevice(
-            self.hass,
-            self._entry_id,
-            self._device_cfg,
-            [command]
-        )
-
-    @property
-    def effect_list(self) -> list[str]:
-        """Return the list of supported effects."""
-        return self._effect_list
-
-    @property
-    def extra_state_attributes(self) -> dict:
-        """Return device-specific state attributes."""
-        attrs = super().extra_state_attributes
-        attrs.update({
-            "segmented_control": self._segmented_capable,
-            "music_mode": self._music_mode_capable
-        })
-        return attrs
-
-    async def async_update(self) -> None:
-        """Update entity state with coordinator data."""
-        await self._coordinator.async_request_refresh()
-        device_data = self._coordinator.data.get(self._device_cfg['device'], {})
         
-        # Update all capabilities from fresh data
-        self._attr_is_on = device_data.get('powerState') == STATE_ON
-        self._attr_brightness = value_to_brightness(
-            self._brightness_scale,
-            device_data.get('brightness')
-        )
-        self._attr_rgb_color = self._getRGBfromI(
-            device_data.get('colorRgb')
-        )
-        self._attr_color_temp_kelvin = device_data.get('colorTemperatureK')
-        
-        # Update effect if available
-        current_scene = device_data.get('lightScene')
-        if current_scene in self._effect_list:
-            self._attr_effect = current_scene
+        if await async_GoveeAPI_ControlDevice(self.hass, self._entry_id, self._device_cfg, command):
+            self.async_write_ha_state()
